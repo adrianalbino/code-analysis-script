@@ -1,6 +1,6 @@
 # code-analysis-script
 
-CLI tool that pulls your latest code from GitHub and analyzes your commits from the past week — code quality, estimated hours, and work patterns — using GPT-4o.
+CLI tool that fetches all your GitHub commits from the past week across every repo and analyzes them — code quality, estimated hours, and work patterns — using GPT-4o.
 
 ## setup
 
@@ -14,19 +14,21 @@ Create a `.env` file in the project root:
 OPENAI_API_KEY=sk-...
 ```
 
+You also need the [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated.
+
 ## usage
 
 ```bash
-node analyze.js /path/to/your/git/repo
+node analyze.js              # defaults to adrianalbino
+node analyze.js <username>   # analyze any GitHub user
 ```
 
 It will:
 
-1. Pull the latest changes from the remote
-2. Find all your commits from the past 7 days
-3. Collect diffs and stats
-4. Send everything to GPT-4o for analysis
-5. Print a report covering:
+1. Fetch all commits from the past 7 days across every repo via the GitHub API
+2. Pull diffs for each commit
+3. Send everything to GPT-4o for analysis
+4. Print a report covering:
    - Code quality ratings (readability, structure, error handling, DRY, security, testing)
    - Estimated coding hours and total working hours
    - Work patterns and productivity insights
@@ -34,6 +36,6 @@ It will:
 
 ## notes
 
-- Uses your `git config user.name` to find your commits
-- Excludes lock files and minified assets from diffs
+- Uses `gh api` (GitHub CLI) to search commits — works with public and your private repos
+- No local git repos needed
 - Requires Node.js 18+

@@ -2,23 +2,14 @@
 
 require("dotenv").config({ path: __dirname + "/.env" });
 const { execFileSync } = require("child_process");
-const path = require("path");
 const OpenAI = require("openai").default;
 
 const DAYS_BACK = 7;
 const MAX_DIFF_CHARS = 6000;
-const MAX_BUFFER = 10 * 1024 * 1024;
+const USERNAME = process.argv[2] || "adrianalbino";
 
-function git(args, cwd) {
-  return execFileSync("git", args, { cwd, encoding: "utf-8", maxBuffer: MAX_BUFFER }).trim();
-}
-
-function gitSafe(args, cwd) {
-  try {
-    return git(args, cwd);
-  } catch {
-    return "";
-  }
+function gh(args) {
+  return execFileSync("gh", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }).trim();
 }
 
 function getSinceDate(daysBack) {
@@ -27,97 +18,75 @@ function getSinceDate(daysBack) {
   return d.toISOString().split("T")[0];
 }
 
-function getRepoPath() {
-  const arg = process.argv[2];
-  if (!arg) {
-    console.error("Usage: node analyze.js <path-to-git-repo>");
-    process.exit(1);
-  }
-  const resolved = path.resolve(arg);
-  const check = gitSafe(["rev-parse", "--git-dir"], resolved);
-  if (!check) {
-    console.error(`Error: "${resolved}" is not a git repository.`);
-    process.exit(1);
-  }
-  return resolved;
+function fetchCommits(username, sinceStr) {
+  // Search all commits by this user across GitHub
+  const query = `author:${username} author-date:>=${sinceStr}`;
+  const result = gh([
+    "api", "search/commits",
+    "--method", "GET",
+    "-f", `q=${query}`,
+    "-f", "sort=author-date",
+    "-f", "order=desc",
+    "-f", "per_page=100",
+    "--jq", `.items[] | {sha: .sha, date: .commit.author.date, message: .commit.message, repo: .repository.full_name, url: .html_url}`
+  ]);
+
+  if (!result) return [];
+
+  return result.split("\n").reduce((acc, line) => {
+    if (!line.trim()) return acc;
+    try {
+      acc.push(JSON.parse(line));
+    } catch {}
+    return acc;
+  }, []);
 }
 
-function pullLatest(repoPath) {
-  console.log("Pulling latest changes...");
+function fetchDiff(repo, sha) {
   try {
-    const result = git(["pull", "--ff-only"], repoPath);
-    console.log(result || "Already up to date.");
-  } catch (err) {
-    console.warn("git pull failed (continuing with local state):", err.message.split("\n")[0]);
+    const result = gh([
+      "api", `repos/${repo}/commits/${sha}`,
+      "--jq", `.files[] | "\\(.filename) | +\\(.additions) -\\(.deletions)\\n\\(.patch // "")"`,
+    ]);
+    return result;
+  } catch {
+    return "(diff unavailable)";
   }
 }
 
-function getAuthorName(repoPath) {
-  return gitSafe(["config", "user.name"], repoPath) || execFileSync("whoami", { encoding: "utf-8" }).trim();
-}
-
-function getCommits(repoPath, author, sinceStr) {
-  const log = gitSafe(
-    ["log", `--author=${author}`, `--since=${sinceStr}`, "--pretty=format:%H|||%ai|||%s", "--no-merges"],
-    repoPath
-  );
-
-  if (!log) return [];
-
-  return log.split("\n").map((line) => {
-    const [hash, date, ...rest] = line.split("|||");
-    return { hash, date, message: rest.join("|||") };
-  });
-}
-
-function getDiff(repoPath, hash) {
-  // For root commits, diff against the empty tree
-  const hasParent = gitSafe(["rev-parse", "--verify", `${hash}^`], repoPath);
-  const range = hasParent ? [`${hash}~1..${hash}`] : [`4b825dc642cb6eb9a060e54bf8d69288fbee4904`, hash];
-
-  const stat = gitSafe(["diff", ...range, "--stat"], repoPath);
-  const diff = gitSafe([
-    "diff", ...range, "-U3",
-    "--", ".", ":(exclude)*.lock", ":(exclude)package-lock.json", ":(exclude)*.min.js", ":(exclude)*.min.css"
-  ], repoPath);
-  return stat + "\n---DIFF---\n" + diff;
-}
-
-function getOverallStats(repoPath, author, sinceStr) {
-  const shortlog = gitSafe(
-    ["log", `--author=${author}`, `--since=${sinceStr}`, "--no-merges", "--shortstat", "--pretty=format:"],
-    repoPath
-  );
-
+function getStats(commits, diffs) {
   let totalInsertions = 0;
   let totalDeletions = 0;
   let totalFiles = 0;
 
-  for (const line of shortlog.split("\n")) {
-    const filesMatch = line.match(/(\d+) files? changed/);
-    const insMatch = line.match(/(\d+) insertions?/);
-    const delMatch = line.match(/(\d+) deletions?/);
-    if (filesMatch) totalFiles += parseInt(filesMatch[1]);
-    if (insMatch) totalInsertions += parseInt(insMatch[1]);
-    if (delMatch) totalDeletions += parseInt(delMatch[1]);
+  for (const diff of diffs) {
+    const lines = diff.split("\n");
+    for (const line of lines) {
+      const match = line.match(/\| \+(\d+) -(\d+)/);
+      if (match) {
+        totalInsertions += parseInt(match[1]);
+        totalDeletions += parseInt(match[2]);
+        totalFiles++;
+      }
+    }
   }
 
   return { totalFiles, totalInsertions, totalDeletions };
 }
 
-function buildCommitTimeline(commits) {
+function buildTimeline(commits) {
   const days = {};
   for (const c of commits) {
     const d = new Date(c.date);
     const dayKey = d.toISOString().split("T")[0];
     const hour = d.getHours();
     if (!days[dayKey]) days[dayKey] = [];
-    days[dayKey].push({ hour, message: c.message });
+    days[dayKey].push({ hour, message: c.message.split("\n")[0], repo: c.repo });
   }
   return days;
 }
 
-async function analyzeWithClaude(commits, diffs, stats, timeline, author) {
+async function analyze(commits, diffs, stats, timeline, username) {
   if (!process.env.OPENAI_API_KEY) {
     console.error("Error: OPENAI_API_KEY environment variable is not set.");
     process.exit(1);
@@ -127,19 +96,24 @@ async function analyzeWithClaude(commits, diffs, stats, timeline, author) {
   const commitDetails = commits.map((c, i) => {
     let diff = diffs[i] || "(no diff available)";
     if (diff.length > MAX_DIFF_CHARS) {
-      diff = diff.slice(0, MAX_DIFF_CHARS) + "\n... [diff truncated for brevity]";
+      diff = diff.slice(0, MAX_DIFF_CHARS) + "\n... [truncated]";
     }
-    return `### Commit: ${c.message}\nDate: ${c.date}\nHash: ${c.hash}\n\n\`\`\`diff\n${diff}\n\`\`\``;
+    return `### [${c.repo}] ${c.message.split("\n")[0]}\nDate: ${c.date}\nSHA: ${c.sha}\n\n\`\`\`diff\n${diff}\n\`\`\``;
   });
 
   const timelineStr = Object.entries(timeline)
     .map(([day, entries]) => {
-      const hours = entries.map((e) => `${e.hour}:00 - "${e.message}"`).join("\n  ");
+      const hours = entries.map((e) => `${e.hour}:00 - [${e.repo}] "${e.message}"`).join("\n  ");
       return `${day}:\n  ${hours}`;
     })
     .join("\n");
 
-  const prompt = `You are a senior engineering manager and code quality expert. Analyze the following git activity from developer "${author}" over the past ${DAYS_BACK} days.
+  const repos = [...new Set(commits.map((c) => c.repo))];
+
+  const prompt = `You are a senior engineering manager and code quality expert. Analyze the following git activity from developer "${username}" over the past ${DAYS_BACK} days across all their GitHub repositories.
+
+## Repositories with activity
+${repos.map((r) => `- ${r}`).join("\n")}
 
 ## Overall Statistics
 - Total commits: ${commits.length}
@@ -186,6 +160,7 @@ Provide:
 - Are commit messages descriptive and consistent?
 - Is work spread evenly or done in bursts?
 - Any signs of rushing (large unfocused commits) or over-engineering?
+- How is work distributed across repos?
 
 ### 4. RECOMMENDATIONS
 - Top 3 specific, actionable improvements for code quality
@@ -193,7 +168,7 @@ Provide:
 
 Keep the analysis honest and constructive. If there's not enough data for a confident assessment in any area, say so explicitly rather than guessing.`;
 
-  console.log("\nAnalyzing with Claude...\n");
+  console.log("\nAnalyzing with GPT-4o...\n");
 
   const response = await client.chat.completions.create({
     model: "gpt-4o",
@@ -210,37 +185,35 @@ Keep the analysis honest and constructive. If there's not enough data for a conf
 }
 
 async function main() {
-  const repoPath = getRepoPath();
-
-  pullLatest(repoPath);
-
-  const author = getAuthorName(repoPath);
-  console.log(`\nAnalyzing commits by: ${author}`);
-  console.log(`Period: last ${DAYS_BACK} days\n`);
-
   const sinceStr = getSinceDate(DAYS_BACK);
-  const commits = getCommits(repoPath, author, sinceStr);
+
+  console.log(`Fetching commits for: ${USERNAME}`);
+  console.log(`Period: last ${DAYS_BACK} days (since ${sinceStr})\n`);
+
+  const commits = fetchCommits(USERNAME, sinceStr);
 
   if (commits.length === 0) {
     console.log("No commits found in the past week. Nothing to analyze.");
     process.exit(0);
   }
 
-  console.log(`Found ${commits.length} commits. Gathering diffs...`);
+  const repos = [...new Set(commits.map((c) => c.repo))];
+  console.log(`Found ${commits.length} commits across ${repos.length} repo(s): ${repos.join(", ")}`);
+  console.log("Fetching diffs...");
 
-  const diffs = commits.map((c) => getDiff(repoPath, c.hash));
-  const stats = getOverallStats(repoPath, author, sinceStr);
-  const timeline = buildCommitTimeline(commits);
+  const diffs = commits.map((c) => fetchDiff(c.repo, c.sha));
+  const stats = getStats(commits, diffs);
+  const timeline = buildTimeline(commits);
 
-  console.log(`Stats: ${stats.totalInsertions} additions, ${stats.totalDeletions} deletions across ${stats.totalFiles} files`);
+  console.log(`Stats: +${stats.totalInsertions} -${stats.totalDeletions} across ${stats.totalFiles} files`);
 
-  const analysis = await analyzeWithClaude(commits, diffs, stats, timeline, author);
+  const analysis = await analyze(commits, diffs, stats, timeline, USERNAME);
 
   console.log("=".repeat(70));
   console.log("  WEEKLY CODE ANALYSIS REPORT");
   console.log("=".repeat(70));
-  console.log(`  Author: ${author}`);
-  console.log(`  Repository: ${repoPath}`);
+  console.log(`  User: ${USERNAME}`);
+  console.log(`  Repos: ${repos.join(", ")}`);
   console.log(`  Period: Last ${DAYS_BACK} days`);
   console.log(`  Commits: ${commits.length}`);
   console.log("=".repeat(70));
